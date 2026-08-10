@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::dispatch::{self, CdpContext};
+use crate::registry::TargetRegistry;
 
 // PR #36 comment 4341743194: the deferral queue in `process_with_interception`
 // must be bounded so a stalled navigation cannot OOM the process. When the cap
@@ -410,6 +411,12 @@ pub async fn start_with_serve_options_limit_and_ready_file(
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
 
+    // Process-wide page target registry (issue #544). Every connection shares
+    // this one so Target.getTargets on any WebSocket and /json/list on the
+    // HTTP accept thread see the same live pages; page ids minted from it are
+    // unique across the whole server.
+    let target_registry = TargetRegistry::default();
+
     // Ctrl-C / graceful shutdown coordination.
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(Notify::new());
@@ -436,6 +443,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
     // above any real connect rate, so the kernel backlog cannot overflow
     // under a connection burst.
     let accept_flag = shutdown_flag.clone();
+    let http_registry = target_registry.clone();
     let accept_auth_token = auth_token.clone();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
@@ -504,6 +512,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
                                 accept_auth_token.as_deref(),
                                 &ws_tx,
                                 &head,
+                                &http_registry,
                             ) {
                                 if !format!("{}", e).contains("close") {
                                     error!("Accept dispatch error: {}", e);
@@ -633,6 +642,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
             persistence_lock.clone(),
             shutdown_notify.clone(),
             live_connections.clone(),
+            target_registry.clone(),
         );
     }
 
@@ -809,6 +819,7 @@ fn run_connection(
     persistence_lock: Arc<std::sync::Mutex<()>>,
     shutdown_notify: Arc<Notify>,
     live_connections: Arc<AtomicUsize>,
+    target_registry: TargetRegistry,
 ) {
     // Releases the slot reserved by the accept loop when the thread unwinds,
     // however it exits — clean close, error return, or panic. A plain
@@ -901,7 +912,7 @@ fn run_connection(
                 // LocalSet task can run 61 times before Tokio services I/O,
                 // starving fetch under a continuously ready page scheduler.
                 let processor = cdp_processor(
-                    msg_rx, default_context, shutdown_notify,
+                    msg_rx, default_context, shutdown_notify, target_registry,
                 );
                 tokio::pin!(processor);
                 tokio::select! {
@@ -1099,6 +1110,7 @@ fn accept_dispatch(
     auth_token: Option<&str>,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
     head: &str,
+    target_registry: &TargetRegistry,
 ) -> anyhow::Result<()> {
     if let Some(refusal) = control_refusal(head, bind_ip, port, forwarded, auth_token) {
         refuse_control_connection(stream, refusal);
@@ -1118,7 +1130,7 @@ fn accept_dispatch(
         // The request head is already sitting in the kernel receive buffer;
         // switch back to blocking mode for the synchronous /json serve.
         let _ = stream.set_nonblocking(false);
-        return handle_http_json_blocking(stream, port, ep, head);
+        return handle_http_json_blocking(stream, port, ep, head, target_registry);
     }
     // Fall through: GET request that isn't a /json endpoint → treat as
     // WebSocket upgrade (Chromium DevTools clients issue GET with
@@ -1147,6 +1159,7 @@ fn handle_http_json_blocking(
     port: u16,
     endpoint: &str,
     request_head: &str,
+    target_registry: &TargetRegistry,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
@@ -1163,15 +1176,30 @@ fn handle_http_json_blocking(
             "WebKit-Version": "537.36",
             "webSocketDebuggerUrl": format!("ws://{}/devtools/browser", authority),
         }))?,
-        "list" => serde_json::to_string_pretty(&json!([{
-            "description": "",
-            "devtoolsFrontendUrl": "",
-            "id": "page-1",
-            "title": "",
-            "type": "page",
-            "url": "about:blank",
-            "webSocketDebuggerUrl": format!("ws://{}/devtools/page/page-1", authority),
-        }]))?,
+        // The list must mirror the live target registry (issue #544), not a
+        // hardcoded synthetic about:blank page. Every page any connection has
+        // created or navigated shows up here with its current url/title.
+        "list" => {
+            let list: Vec<serde_json::Value> = target_registry
+                .all()
+                .into_iter()
+                .map(|target| {
+                    json!({
+                        "description": "",
+                        "devtoolsFrontendUrl": "",
+                        "id": target.target_id,
+                        "title": target.title,
+                        "type": "page",
+                        "url": target.url,
+                        "webSocketDebuggerUrl": format!(
+                            "ws://{}/devtools/page/{}",
+                            authority, target.target_id
+                        ),
+                    })
+                })
+                .collect();
+            serde_json::to_string_pretty(&list)?
+        }
         "protocol" => {
             serde_json::to_string_pretty(&json!({ "version": { "major": "1", "minor": "3" } }))?
         }
@@ -1219,8 +1247,9 @@ async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     default_context: Arc<obscura_browser::BrowserContext>,
     shutdown_notify: Arc<Notify>,
+    target_registry: TargetRegistry,
 ) {
-    let mut ctx = CdpContext::new_with_shared_context(default_context);
+    let mut ctx = CdpContext::new_with_shared_context_and_registry(default_context, target_registry);
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
@@ -2151,6 +2180,10 @@ async fn process_with_interception(
     let reached_network_idle = page.lifecycle.is_network_idle();
 
     ctx.pages.push(page);
+    // Navigation changed the page's url/title: refresh its global target
+    // entry so every connection's getTargets and /json/list see the new
+    // document, not the stale about:blank snapshot.
+    ctx.sync_registry();
 
     let response = if cancelled {
         crate::types::CdpResponse::success(req.id,
@@ -2833,11 +2866,12 @@ mod tests {
                 let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
                 let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-                let default_context = crate::dispatch::CdpContext::new().default_context;
+                let default_context = crate::dispatch::CdpContext::new().default_context.clone();
                 let processor = tokio::task::spawn_local(super::cdp_processor(
                     server_rx,
                     default_context,
                     shutdown,
+                    crate::registry::TargetRegistry::default(),
                 ));
 
                 server_tx
@@ -2970,11 +3004,12 @@ mod tests {
                 let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
                 let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
                 let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-                let default_context = crate::dispatch::CdpContext::new().default_context;
+                let default_context = crate::dispatch::CdpContext::new().default_context.clone();
                 let processor = tokio::task::spawn_local(super::cdp_processor(
                     server_rx,
                     default_context,
                     shutdown,
+                    crate::registry::TargetRegistry::default(),
                 ));
 
                 server_tx
