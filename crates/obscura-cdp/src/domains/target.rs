@@ -297,7 +297,12 @@ pub async fn handle(
             if !ctx.registry.all().iter().any(|t| t.target_id == target_id) {
                 return Err("Target not found".to_string());
             }
-            close_target(ctx, target_id);
+            if ctx.get_page(target_id).is_some() {
+                close_target(ctx, target_id);
+            } else {
+                ctx.sessions.retain(|_, page_id| page_id != target_id);
+                ctx.registry.mark_closed(&[target_id.to_string()]);
+            }
             Ok(json!({ "success": true }))
         }
         "setAutoAttach" => {

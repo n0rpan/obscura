@@ -941,7 +941,7 @@ fn run_connection(
                 }
             };
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, async move {
+            local.block_on(&rt, async {
                 // Run the processor in the connection future. A self-waking
                 // LocalSet task can run 61 times before Tokio services I/O,
                 // starving fetch under a continuously ready page scheduler.
@@ -1473,9 +1473,11 @@ async fn cdp_processor(
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
                 connection_reply_tx = Some(reply_tx.clone());
+                let pid = ctx.create_page();
+                let sid = format!("{pid}-session");
+                ctx.sessions.insert(sid.clone(), pid.clone());
                 let _ = reply_tx.send(
-                    json!({"__init": true})
-                        .to_string(),
+                    json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string(),
                 );
             }
             ServerMessage::Cdp(cdp_msg) => {
@@ -1792,7 +1794,7 @@ async fn handle_remote_exec(
         .await;
     } else {
         let fetch_was_resolved = rewritten.contains("Fetch.")
-            && handle_fetch_resolution(&rewritten, ctx, &wrap_tx, intercepted_paused);
+            && handle_fetch_resolution(&rewritten, &wrap_tx, intercepted_paused);
         if !fetch_was_resolved {
             process_cdp_message(&rewritten, ctx, &wrap_tx).await;
         }
@@ -2678,6 +2680,7 @@ async fn process_cdp_message_with_pending(
     // forever for attachedToTarget events that never come. Match Chromium's
     // ordering so connect completes and the flood is processed afterwards.
     let response_before_events = req.method == "Target.setDiscoverTargets";
+    let deferred_response = evaluation.is_some() && pending_runtime.is_some();
     if response_before_events {
         if let Ok(json) = serde_json::to_string(&response) {
             let _ = reply_tx.send(json);
@@ -2693,8 +2696,10 @@ async fn process_cdp_message_with_pending(
                 let _ = reply_tx.send(json);
             }
         }
-        if let Ok(json) = serde_json::to_string(&response) {
-            let _ = reply_tx.send(json);
+        if !deferred_response {
+            if let Ok(json) = serde_json::to_string(&response) {
+                let _ = reply_tx.send(json);
+            }
         }
     }
 
@@ -2702,8 +2707,6 @@ async fn process_cdp_message_with_pending(
         pending.push(PendingRuntimeReply {
             id: req.id, session_id: req.session_id, reply_tx: reply_tx.clone(), evaluation,
         });
-    } else {
-        if let Ok(json) = serde_json::to_string(&response) { let _ = reply_tx.send(json); }
     }
 
 }
@@ -2864,6 +2867,90 @@ async fn handle_connection_ws(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_command_emits_exactly_one_response() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        super::process_cdp_message(
+            r#"{"id":123,"method":"Target.getTargets","params":{}}"#,
+            &mut ctx, &tx,
+        ).await;
+        let response: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(response["id"], 123);
+        assert!(rx.try_recv().is_err(), "a command must not emit a duplicate response");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fresh_connection_sees_page_targets_in_get_targets() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+                let default_context = crate::dispatch::CdpContext::new().default_context.clone();
+                let processor = tokio::task::spawn_local(super::cdp_processor(
+                    server_rx,
+                    default_context,
+                    shutdown.clone(),
+                    crate::registry::TargetRegistry::default(),
+                    server_tx.clone(),
+                    std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+                ));
+
+                server_tx
+                    .send(super::ServerMessage::NewConnection {
+                        reply_tx: reply_tx.clone(),
+                    })
+                    .unwrap();
+                let init = reply_rx.recv().await.expect("processor init");
+                assert!(init.contains("__init"));
+
+                let send = |value: serde_json::Value| {
+                    server_tx
+                        .send(super::ServerMessage::Cdp(super::CdpMessage {
+                            text: value.to_string(),
+                            reply_tx: reply_tx.clone(),
+                        }))
+                        .unwrap();
+                };
+                send(json!({"id": 1, "method": "Target.getTargets", "params": {}}));
+
+                loop {
+                    let value: serde_json::Value = serde_json::from_str(
+                        &tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            reply_rx.recv(),
+                        )
+                        .await
+                        .expect("getTargets response timeout")
+                        .expect("getTargets response channel"),
+                    )
+                    .unwrap();
+                    if value["id"] == 1 {
+                        let targets = value["result"]["targetInfos"]
+                            .as_array()
+                            .expect("targetInfos must be an array");
+                        assert!(
+                            !targets.is_empty(),
+                            "getTargets must list the connection's page target"
+                        );
+                        assert_eq!(targets[0]["type"], "page");
+                        break;
+                    }
+                }
+
+                shutdown.notify_waiters();
+                drop(server_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(2), processor)
+                    .await
+                    .expect("processor shutdown timeout")
+                    .expect("processor task");
+            })
+            .await;
+    }
+
+
+
     use super::{
         bearer_authorized, control_refusal, handle_fetch_resolution, is_navigate_method,
         merge_cookie_delta, parse_cdp_headers, pump_live_page_event_loop,
@@ -3104,9 +3191,10 @@ mod tests {
         let accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             stream.set_nodelay(true).unwrap();
-            let context = crate::dispatch::CdpContext::new().default_context;
+            let context = crate::dispatch::CdpContext::new().default_context.clone();
             super::run_connection(stream.into_std().unwrap(), context.clone(), context,
-                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server);
+                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server,
+                Arc::new(std::sync::Mutex::new(HashMap::new())), crate::registry::TargetRegistry::default());
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
         accept.await.unwrap();
@@ -3174,9 +3262,10 @@ mod tests {
         let accept = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             stream.set_nodelay(true).unwrap();
-            let context = crate::dispatch::CdpContext::new().default_context;
+            let context = crate::dispatch::CdpContext::new().default_context.clone();
             super::run_connection(stream.into_std().unwrap(), context.clone(), context,
-                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server);
+                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()), live_server,
+                Arc::new(std::sync::Mutex::new(HashMap::new())), crate::registry::TargetRegistry::default());
         });
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
         accept.await.unwrap();
@@ -4043,9 +4132,11 @@ mod tests {
         tokio::task::LocalSet::new().run_until(async {
             let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
-            let context = crate::dispatch::CdpContext::new().default_context;
+            let context = crate::dispatch::CdpContext::new().default_context.clone();
             let processor = tokio::task::spawn_local(super::cdp_processor(
                 server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()),
+                crate::registry::TargetRegistry::default(), tokio::sync::mpsc::unbounded_channel().0,
+                std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             ));
             server_tx.send(super::ServerMessage::NewConnection {
                 reply_tx: reply_tx.clone(),
@@ -4141,8 +4232,10 @@ mod tests {
             let (server_tx, server_rx) = mpsc::unbounded_channel();
             let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
             let processor = tokio::task::spawn_local(cdp_processor(
-                server_rx, CdpContext::new().default_context,
+                server_rx, CdpContext::new().default_context.clone(),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
+                crate::registry::TargetRegistry::default(), tokio::sync::mpsc::unbounded_channel().0,
+                std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             ));
             server_tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
             reply_rx.recv().await.unwrap();
@@ -4232,9 +4325,11 @@ mod tests {
         tokio::task::LocalSet::new().run_until(async {
             let (server_tx, server_rx) = mpsc::unbounded_channel();
             let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
-            let context = CdpContext::new().default_context;
+            let context = CdpContext::new().default_context.clone();
             let processor = tokio::task::spawn_local(cdp_processor(
                 server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()),
+                crate::registry::TargetRegistry::default(), tokio::sync::mpsc::unbounded_channel().0,
+                std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             ));
             server_tx.send(ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
             reply_rx.recv().await.unwrap();
@@ -4324,9 +4419,11 @@ mod tests {
         tokio::task::LocalSet::new().run_until(async {
             let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
-            let context = crate::dispatch::CdpContext::new().default_context;
+            let context = crate::dispatch::CdpContext::new().default_context.clone();
             let processor = tokio::task::spawn_local(super::cdp_processor(
                 server_rx, context, std::sync::Arc::new(tokio::sync::Notify::new()),
+                crate::registry::TargetRegistry::default(), tokio::sync::mpsc::unbounded_channel().0,
+                std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             ));
             server_tx.send(super::ServerMessage::NewConnection { reply_tx: reply_tx.clone() }).unwrap();
             reply_rx.recv().await.unwrap();
